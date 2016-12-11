@@ -607,21 +607,26 @@ app.post('/feeditem/:feeditemid/comments', validate({ body: CommentSchema }), fu
   var fromUser = getUserIdFromToken(req.get('Authorization'));
   var comment = req.body;
   var author = req.body.author;
-  var feedItemId = req.params.feeditemid;
   if (fromUser === author) {
-    var feedItem = readDocument('feedItems', feedItemId);
     // Initialize likeCounter to empty.
     comment.likeCounter = [];
     // Push returns the new length of the array.
     // The index of the new element is the length of the array minus 1.
     // Example: [].push(1) returns 1, but the index of the new element is 0.
-    var index = feedItem.comments.push(comment) - 1;
-    writeDocument('feedItems', feedItem);
-    // 201: Created.
-    res.status(201);
-    res.set('Location', '/feeditem/' + feedItemId + "/comments/" + index);
-    // Return a resolved version of the feed item.
-    res.send(getFeedItemSync(feedItemId));
+    postStatusUpdate(new ObjectID(fromUser), comment.location, comment.contents, comment.image, function(err, newUpdate) {
+      if (err) {
+        // A database error happened.
+        // 500: Internal error.
+        res.status(500).send("A database error occurred: " + err);
+      } else {
+        // When POST creates a new resource, we should tell the client about it
+        // in the 'Location' header and use status code 201.
+        res.status(201);
+        res.set('Location', '/feeditem/' + newUpdate._id);
+          // Send the update!
+        res.send(newUpdate);
+      }
+    });
   } else {
     // Unauthorized.
     res.status(401).end();
@@ -635,16 +640,34 @@ app.put('/feeditem/:feeditemid/comments/:commentindex/likelist/:userid', functio
   var commentIdx = parseInt(req.params.commentindex, 10);
   // Only a user can mess with their own like.
   if (fromUser === userId) {
-    var feedItem = readDocument('feedItems', feedItemId);
-    var comment = feedItem.comments[commentIdx];
-    // Only change the likeCounter if the user isn't in it.
-    if (comment.likeCounter.indexOf(userId) === -1) {
-      comment.likeCounter.push(userId);
-    }
-    writeDocument('feedItems', feedItem);
-    comment.author = readDocument('users', comment.author);
-    // Send back the updated comment.
-    res.send(comment);
+    // First, we can update the like counter.
+    db.collection('feedItems').comments[commentIdx].updateOne({ _id: feedItemId },
+      {
+        // Add `userId` to the likeCounter if it is not already
+        // in the array.
+        $addToSet: {
+          likeCounter: new ObjectID(userId)
+        }
+      }, function(err) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+        // Second, grab the feed item now that we have updated it.
+        db.collection('feedItems').findOne({ _id: feedItemId }, function(err, feedItem) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+          // Return a resolved version of the likeCounter
+          resolveUserObjects(feedItem.likeCounter, function(err, userMap) {
+            if (err) {
+              return sendDatabaseError(res, err);
+            }
+            // Return a resolved version of the likeCounter
+            res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+          });
+        }
+      );
+    });
   } else {
     // Unauthorized.
     res.status(401).end();
@@ -658,15 +681,32 @@ app.delete('/feeditem/:feeditemid/comments/:commentindex/likelist/:userid', func
   var commentIdx = parseInt(req.params.commentindex, 10);
   // Only a user can mess with their own like.
   if (fromUser === userId) {
-    var feedItem = readDocument('feedItems', feedItemId);
-    var comment = feedItem.comments[commentIdx];
-    var userIndex = comment.likeCounter.indexOf(userId);
-    if (userIndex !== -1) {
-      comment.likeCounter.splice(userIndex, 1);
-      writeDocument('feedItems', feedItem);
-    }
-    comment.author = readDocument('users', comment.author);
-    res.send(comment);
+    // Step 1: Remove userId from the likeCounter.
+    db.collection('feedItems').comments[commentIdx].updateOne({ _id: feedItemId },
+      {
+        // Only removes the userId from the likeCounter, if it is in the likeCounter.
+        $pull: {
+          likeCounter: new ObjectID(userId)
+        }
+      }, function(err) {
+      if (err) {
+        return sendDatabaseError(res, err);
+      }
+      // Step 2: Get the feed item.
+      db.collection('feedItems').findOne({ _id: feedItemId }, function(err, feedItem) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+        // Step 3: Resolve the user IDs in the like counter into user objects.
+        resolveUserObjects(feedItem.likeCounter, function(err, userMap) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+          // Return a resolved version of the likeCounter
+          res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+        });
+      });
+    });
   } else {
     // Unauthorized.
     res.status(401).end();
